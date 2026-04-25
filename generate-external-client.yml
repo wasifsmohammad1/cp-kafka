@@ -38,11 +38,15 @@
     ca_search_paths:
       - "{{ ca_dir | default('') }}"
       - "{{ playbook_dir }}/generated_ssl_files"
-      - "{{ playbook_dir }}/.../generated_ssl_files"
+      - "/root/.ansible/collections/ansible_collections/confluent/platform/playbooks/generated_ssl_files"
       - "/root/generated_ssl_files"
       - "/tmp/generated_ssl_files"
       - "{{ ansible_env.HOME | default('/root') }}/generated_ssl_files"
     keystore_pass: "{{ keystore_pass | default(lookup('password', '/dev/null length=20 chars=ascii_letters,digits')) }}"
+    # cp-ansible encrypts the snakeoil CA key. Default for 7.x is "capassword".
+    # If your inventory sets ssl_self_signed_ca_password to something else,
+    # pass it through:    -e "ca_password=YourPassword"
+    ca_password: "{{ ca_password | default(ssl_self_signed_ca_password | default('capassword')) }}"
 
   tasks:
 
@@ -112,15 +116,33 @@
         creates: "{{ out_dir }}/{{ client_cn }}.csr"
 
     - name: Sign with the cluster CA (1 year)
-      ansible.builtin.command: >
-        openssl x509 -req -in {{ out_dir }}/{{ client_cn }}.csr
-                     -CA {{ ca_dir_resolved }}/{{ ca_cert_name }}
-                     -CAkey {{ ca_dir_resolved }}/{{ ca_key_name }}
-                     -CAcreateserial
-                     -out {{ out_dir }}/{{ client_cn }}.crt
-                     -days 365 -sha256
+      # -passin pass:... feeds the CA-key passphrase in non-interactively.
+      # -CAserial writes the serial file into our output dir (the CA dir
+      # may be read-only / shared, where -CAcreateserial would explode).
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -req
+          - -in
+          - "{{ out_dir }}/{{ client_cn }}.csr"
+          - -CA
+          - "{{ ca_dir_resolved }}/{{ ca_cert_name }}"
+          - -CAkey
+          - "{{ ca_dir_resolved }}/{{ ca_key_name }}"
+          - -passin
+          - "pass:{{ ca_password }}"
+          - -CAcreateserial
+          - -CAserial
+          - "{{ out_dir }}/ca.srl"
+          - -out
+          - "{{ out_dir }}/{{ client_cn }}.crt"
+          - -days
+          - "365"
+          - -sha256
       args:
         creates: "{{ out_dir }}/{{ client_cn }}.crt"
+      no_log: true   # don't echo the CA password
 
     - name: Copy CA cert into the bundle
       ansible.builtin.copy:
