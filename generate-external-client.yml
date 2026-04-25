@@ -46,40 +46,50 @@
 
   tasks:
 
-    - name: Find a directory containing the snakeoil CA cert + key
+    # cp-ansible names the CA files with a "-1" suffix, e.g.
+    #   snakeoil-ca-1.crt   snakeoil-ca-1.key
+    # Some older deploys use the bare "snakeoil-ca.crt" form. We probe both.
+    - name: Probe candidate CA filenames in each search path
       ansible.builtin.stat:
-        path: "{{ item }}/snakeoil-ca.crt"
-      loop: "{{ ca_search_paths | reject('equalto','') | list }}"
+        path: "{{ item.0 }}/{{ item.1 }}"
+      loop: "{{ (ca_search_paths | reject('equalto','') | list) | product(['snakeoil-ca-1.crt','snakeoil-ca.crt']) | list }}"
       register: ca_probe
       changed_when: false
 
-    - name: Pick the first match
+    - name: Pick the first match (resolves both directory AND filename)
       ansible.builtin.set_fact:
-        ca_dir_resolved: "{{ (ca_probe.results | selectattr('stat.exists','equalto',true) | map(attribute='item') | list | first) | default('') }}"
+        ca_hit: "{{ (ca_probe.results | selectattr('stat.exists','equalto',true) | list | first) | default({}) }}"
 
     - name: Fail with a useful message if the CA cannot be located
       ansible.builtin.fail:
         msg: |
           Could not find cp-ansible's snakeoil CA on the control node.
-          Searched: {{ ca_search_paths | reject('equalto','') | list }}
+          Searched dirs : {{ ca_search_paths | reject('equalto','') | list }}
+          Filenames     : snakeoil-ca-1.crt, snakeoil-ca.crt
           Locate it manually with:
-              find / -name 'snakeoil-ca*.crt' 2>/dev/null
+              sudo find / -name 'snakeoil-ca*.crt' 2>/dev/null
           then re-run with: -e "ca_dir=/full/path/to/dir"
-      when: ca_dir_resolved == ''
+      when: ca_hit == {}
+
+    - name: Resolve CA cert + key paths from the matched probe
+      ansible.builtin.set_fact:
+        ca_dir_resolved: "{{ ca_hit.item.0 }}"
+        ca_cert_name: "{{ ca_hit.item.1 }}"
+        ca_key_name:  "{{ ca_hit.item.1 | regex_replace('\\.crt$', '.key') }}"
 
     - name: Confirm CA private key is also present
       ansible.builtin.stat:
-        path: "{{ ca_dir_resolved }}/snakeoil-ca.key"
+        path: "{{ ca_dir_resolved }}/{{ ca_key_name }}"
       register: ca_key_stat
 
     - name: Fail if CA private key is missing
       ansible.builtin.fail:
-        msg: "Found {{ ca_dir_resolved }}/snakeoil-ca.crt but no snakeoil-ca.key — cannot sign without it."
+        msg: "Found {{ ca_dir_resolved }}/{{ ca_cert_name }} but no matching key {{ ca_key_name }} — cannot sign without it."
       when: not ca_key_stat.stat.exists
 
     - name: Show the resolved CA location
       ansible.builtin.debug:
-        msg: "Using CA from {{ ca_dir_resolved }}"
+        msg: "Using CA cert {{ ca_dir_resolved }}/{{ ca_cert_name }} + key {{ ca_dir_resolved }}/{{ ca_key_name }}"
 
     - name: Output workspace
       ansible.builtin.file:
@@ -104,8 +114,8 @@
     - name: Sign with the cluster CA (1 year)
       ansible.builtin.command: >
         openssl x509 -req -in {{ out_dir }}/{{ client_cn }}.csr
-                     -CA {{ ca_dir_resolved }}/snakeoil-ca.crt
-                     -CAkey {{ ca_dir_resolved }}/snakeoil-ca.key
+                     -CA {{ ca_dir_resolved }}/{{ ca_cert_name }}
+                     -CAkey {{ ca_dir_resolved }}/{{ ca_key_name }}
                      -CAcreateserial
                      -out {{ out_dir }}/{{ client_cn }}.crt
                      -days 365 -sha256
@@ -114,7 +124,7 @@
 
     - name: Copy CA cert into the bundle
       ansible.builtin.copy:
-        src: "{{ ca_dir_resolved }}/snakeoil-ca.crt"
+        src: "{{ ca_dir_resolved }}/{{ ca_cert_name }}"
         dest: "{{ out_dir }}/ca.crt"
         mode: "0644"
         remote_src: false
