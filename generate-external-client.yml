@@ -31,8 +31,12 @@
   gather_facts: false
   become: false
   vars:
-    client_cn: "{{ client_cn | default('external-client') }}"
-    client_principal: "{{ client_principal | default(client_cn) }}"
+    # IMPORTANT: variables here MUST NOT reference themselves. If you see
+    # "An unhandled exception occurred while templating" with the same line
+    # repeated 50x, it's because a var like   foo: "{{ foo | default(...) }}"
+    # is recursing. Use distinct override-input names to avoid it.
+    client_cn: "{{ in_client_cn | default('external-client') }}"
+    client_principal: "{{ in_client_principal | default(client_cn) }}"
     out_dir: "{{ playbook_dir }}/client_certs/{{ client_cn }}"
     # Common cp-ansible CA locations. First match wins. Override with -e ca_dir=...
     ca_search_paths:
@@ -42,13 +46,22 @@
       - "/root/generated_ssl_files"
       - "/tmp/generated_ssl_files"
       - "{{ ansible_env.HOME | default('/root') }}/generated_ssl_files"
-    keystore_pass: "{{ keystore_pass | default(lookup('password', '/dev/null length=20 chars=ascii_letters,digits')) }}"
     # cp-ansible encrypts the snakeoil CA key. Default for 7.x is "capassword".
-    # If your inventory sets ssl_self_signed_ca_password to something else,
-    # pass it through:    -e "ca_password=YourPassword"
-    ca_password: "{{ ca_password | default(ssl_self_signed_ca_password | default('capassword')) }}"
+    # Override with: -e "ca_pass=YourPassword"
+    # Or set ssl_self_signed_ca_password in your inventory.
+    ca_password: "{{ ca_pass | default(ssl_self_signed_ca_password | default('capassword')) }}"
+    # NOTE: keystore_pass is intentionally NOT defined here as a templated
+    # variable. lookup('password','/dev/null...') returns a NEW value every
+    # call, which would silently put a different password into the JKS than
+    # into client.properties. Instead it's set as a fact in the first task
+    # below (deterministic across the rest of the play) and read by later
+    # plays via hostvars['localhost'].keystore_pass.
 
   tasks:
+
+    - name: Pin keystore password ONCE so it's identical across all later tasks/plays
+      ansible.builtin.set_fact:
+        keystore_pass: "{{ ks_pass | default(lookup('password', '/dev/null length=20 chars=ascii_letters,digits')) }}"
 
     # cp-ansible names the CA files with a "-1" suffix, e.g.
     #   snakeoil-ca-1.crt   snakeoil-ca-1.key
@@ -220,7 +233,7 @@
   become: true
   gather_facts: false
   vars:
-    client_cn: "{{ client_cn | default('external-client') }}"
+    client_cn: "{{ in_client_cn | default('external-client') }}"
     out_dir: "{{ hostvars['localhost'].playbook_dir | default(playbook_dir) }}/client_certs/{{ client_cn }}"
   tasks:
 
@@ -256,8 +269,18 @@
       when: ts_creds_find.files | length > 0
 
     - name: Stash truststore password as a fact
+      # Resolution order:
+      #   1. -e "ts_pass=..." passed at the CLI (explicit override)
+      #   2. Whatever cp-ansible wrote to *.truststore.jks_creds on the broker
+      #   3. cp-ansible's documented default: confluenttruststorepass
       ansible.builtin.set_fact:
-        truststore_password: "{{ (ts_pw_b64.content | b64decode | trim) if (ts_pw_b64.content is defined) else 'confluenttruststorepass' }}"
+        truststore_password: >-
+          {{ ts_pass
+             | default(
+                 (ts_pw_b64.content | b64decode | trim)
+                 if (ts_pw_b64.content is defined)
+                 else 'confluenttruststorepass'
+             ) }}
 
 # -----------------------------------------------------------------------------
 # Step 3 — back on control node: write client.properties using the real
@@ -269,8 +292,12 @@
   gather_facts: false
   become: false
   vars:
-    client_cn: "{{ client_cn | default('external-client') }}"
+    client_cn: "{{ in_client_cn | default('external-client') }}"
+    client_principal: "{{ in_client_principal | default(client_cn) }}"
     out_dir: "{{ playbook_dir }}/client_certs/{{ client_cn }}"
+    # IMPORTANT: keystore_pass is read back from the fact set in play 1.
+    # Hostvars on localhost survive across plays in the same run.
+    keystore_password: "{{ hostvars['localhost'].keystore_pass | default('CHANGE_ME_KEYSTORE_PASSWORD') }}"
     truststore_password: "{{ hostvars['kafka4.ocpll.fmr.com'].truststore_password | default('confluenttruststorepass') }}"
 
   tasks:
@@ -285,8 +312,8 @@
           ssl.truststore.location={{ out_dir }}/truststore.jks
           ssl.truststore.password={{ truststore_password }}
           ssl.keystore.location={{ out_dir }}/{{ client_cn }}.keystore.jks
-          ssl.keystore.password={{ keystore_pass | default('CHANGE_ME') }}
-          ssl.key.password={{ keystore_pass | default('CHANGE_ME') }}
+          ssl.keystore.password={{ keystore_password }}
+          ssl.key.password={{ keystore_password }}
           ssl.endpoint.identification.algorithm=HTTPS
 
     - name: Done — what to do next
@@ -300,7 +327,7 @@
             - truststore.jks                 (copied from kafka4)
             - client.properties              (drop this into --command-config)
 
-          Keystore password: {{ keystore_pass | default('see ./client_certs/' + client_cn + '/client.properties') }}
+          Keystore password: {{ keystore_password }}
 
           Smoke test:
             kafka-topics --bootstrap-server kafka4.ocpll.fmr.com:9094 \
