@@ -95,6 +95,42 @@
       ansible.builtin.debug:
         msg: "Using CA cert {{ ca_dir_resolved }}/{{ ca_cert_name }} + key {{ ca_dir_resolved }}/{{ ca_key_name }}"
 
+    # Verify the CA passphrase BEFORE we try to sign so we can fail with a
+    # clear, actionable error instead of an opaque openssl one.
+    - name: Verify the CA passphrase decrypts the key
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - rsa
+          - -in
+          - "{{ ca_dir_resolved }}/{{ ca_key_name }}"
+          - -passin
+          - "pass:{{ ca_password }}"
+          - -noout
+      register: ca_pw_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail clearly if the CA passphrase is wrong
+      ansible.builtin.fail:
+        msg: |
+          CA passphrase rejected by openssl when reading
+            {{ ca_dir_resolved }}/{{ ca_key_name }}
+
+          Currently trying: '{{ ca_password }}'
+          (default is 'capassword' for cp-ansible 7.x; your inventory may
+          override via ssl_self_signed_ca_password).
+
+          Find the real passphrase:
+            grep -rh ssl_self_signed_ca_password ~/.ansible/collections/ansible_collections/confluent/ 2>/dev/null
+            grep -i ssl_self_signed_ca_password hosts.yml
+
+          Or test candidate passphrases by hand:
+            openssl rsa -in {{ ca_dir_resolved }}/{{ ca_key_name }} -passin pass:CANDIDATE -noout
+
+          Re-run with: -e "ca_password=<the-real-one>"
+      when: ca_pw_check.rc != 0
+
     - name: Output workspace
       ansible.builtin.file:
         path: "{{ out_dir }}"
@@ -142,7 +178,6 @@
           - -sha256
       args:
         creates: "{{ out_dir }}/{{ client_cn }}.crt"
-      no_log: true   # don't echo the CA password
 
     - name: Copy CA cert into the bundle
       ansible.builtin.copy:
